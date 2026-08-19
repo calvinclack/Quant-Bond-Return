@@ -1,37 +1,41 @@
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from itertools import combinations
-from sklearn.svm import SVR
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_absolute_error
 from sklearn.cross_decomposition import PLSRegression
-
-
-# To do
-
-# Fix Plot
-#https://www.quantbeckman.com/p/with-code-combinatorial-purged-cross
 
 
 # Parameters ___________________________________________________
 target_col       = 'GS10'  # df_O column to predict/trade, e.g. 'GS10', ln(GSCI), ln(SP500), 'ln(Gold)'
-windsor_value    = 0
-windsor_value_X  = 0
-fwd_periods      = 1      # forward return horizon in months
-show_plots       = True   # False = skip all matplotlib plots
-kernel_degree    = 1       # polynomial degree for SVR kernel
+# Option to Windsorize X and y Variable
+windsor_value    = 0 #y
+windsor_value_X  = 0 # X
+# Option to remove Covid Data
 exclude_covid    = False    # True = drop 2020-01-01 to 2021-01-01
-run_gs10_splits   = False    # True = percentile-split backtests for GS10 across all X variables
-run_gs10_stepwise = False     # True = stepwise majority-vote signal using percentile splits
-modified_sharpe   = False    # True = Sharpe × avg_position; False = standard Sharpe
+show_plots       = True   # False = skip all matplotlib plots
+# Visualize splitting long vs short over specific percentiles of each variable
+# This is more so used to visually see how each individual variable split performed 
+run_gs10_splits   = False    # True = percentile-split backtests for GS10 across all X variables (This is more descriptive than anything else)
+# used as risk adjsuted return benchmark
+use_sortino       = False    # True = downside-deviation (Sortino) ratio; False = standard-deviation (Sharpe) ratio
 direction         = 'long_short'   # 'long' = 0/1, 'long_short' = ±1, 'short' = 0/−1
-capped_10      = 3   # how many times each variable can appear in the top 10
+#cpcv parameters
 cpcv_n_groups  = 6   # CPCV: split data into N groups; C(N, k) total folds
 cpcv_k_test    = 2   # CPCV: number of groups held out as test per fold
-run_gs_pls            = True  # True = PLS regression on GS10 with CPCV, 1-10 components
+#pls parameters
+run_gs_pls            = True  # True = PLS regression on GS10 with CPCV, 1 components
 pls_direction_filter  = True  # True = long only when GS10_diff12 < 0, short only when > 0
-pls_pos_power         = 0.2   # position = sign(pos) * |pos|^power  (1.0 = no adjustment)
+pls_pos_power         = .5   # position = sign(pos) * |pos|^power  (1.0 = no adjustment)
+
+def _risk_denom(x):
+    """Standard deviation (Sharpe) or downside deviation vs. 0 (Sortino),
+    selected by use_sortino."""
+    if use_sortino:
+        return np.sqrt(np.mean(np.minimum(x, 0.0) ** 2))
+    return x.std()
+
+def _score_label():
+    return "SoR" if use_sortino else "SR"
 
 # Load Data ____________________________________________________
 df = pd.read_csv('Macro Trading Factors.csv', parse_dates=['Date'])
@@ -48,24 +52,24 @@ df_O = df_O.sort_values('Date')
 
 # Create X and y variables_______________________________________
 
-# y: forward fwd_periods-month cumulative return less fwd_periods months of risk-free rate
+# y: forward 1-month cumulative return less 1 month of risk-free rate
 df_O_idx    = df_O.set_index('Date')
-fwd_returns = df_O.iloc[:, 2:].diff(fwd_periods).shift(-fwd_periods)
-y           = fwd_returns.subtract(df_O.iloc[:, 1].values * fwd_periods / 1200, axis=0)
+fwd_returns = df_O.iloc[:, 2:].diff(1).shift(-1)
+y           = fwd_returns.subtract(df_O.iloc[:, 1].values / 1200, axis=0)
 y.index     = df_O['Date']
 
 dtb3 = df_O_idx['DTB3']
 for col, tenor in [('GS5', 5), ('GS10', 10)]:
     if col in y.columns:
         price = 1 / (1 + df_O_idx[col] / 100) ** tenor
-        fwd_price_return = price.pct_change(fwd_periods).shift(-fwd_periods)
-        y[col] = fwd_price_return + df_O_idx[col] * fwd_periods / 1200 - dtb3 * fwd_periods / 1200
+        fwd_price_return = price.pct_change(1).shift(-1)
+        y[col] = fwd_price_return + df_O_idx[col] / 1200 - dtb3 / 1200
 
 for col in ['DTB3', 'BAA_AAA']:
     if col not in y.columns and col in df_O_idx.columns:
-        y[col] = df_O_idx[col].diff(fwd_periods).shift(-fwd_periods)
+        y[col] = df_O_idx[col].diff(1).shift(-1)
 
-# 1-month forward return reference — used for Sharpe/P&L regardless of fwd_periods,
+# 1-month forward return reference — used for Sharpe/P&L,
 # so model targets can use a longer horizon while performance is always scored on
 # the actual realized 1-month return.
 fwd_returns_1m = df_O.iloc[:, 2:].diff(1).shift(-1)
@@ -90,16 +94,16 @@ X = X.join(df_O_idx[['BAA_AAA','GS10_DTB3', 'DTB3']], how='left')
 lag_periods = [3, 6, 9, 12]
 _lag_base = df_O_idx.drop(columns=['GS10_DTB3'], errors='ignore')
 lag_diffs = pd.concat(
-    [_lag_base.diff(k).add_suffix(f'_diff{k}') for k in [3, 6, 9, 12]],
+    [_lag_base.diff(k).add_suffix(f'_diff{k}') for k in lag_periods],
     axis=1,
 )
 X = X.join(lag_diffs, how='left')
 
 # CPCV embargo width: test obs within max(lag_periods) periods of training data
-# have features (backward-looking diffs) or labels (fwd_periods ahead) that
+# have features (backward-looking diffs) or labels (1 period ahead) that
 # reach into training data, so trim that much off every test-block edge that
 # borders training.
-cpcv_embargo_periods = max(fwd_periods, max(lag_periods))
+cpcv_embargo_periods = max(1, max(lag_periods))
 
 def _trim_test_edges(test_idx_full, n_obs_, embargo):
     """Drop the first/last `embargo` obs of each contiguous run in
@@ -142,22 +146,13 @@ X_feat_scaled = pd.DataFrame(
     columns=X_feat_cols,
     index=X_feat.index,
 )
-col_pos = {c: i for i, c in enumerate(X_feat_cols)}
-
-def to_scaled(x1, x2, arr):
-    i1, i2 = col_pos[x1], col_pos[x2]
-    means  = np.array([scaler_X.mean_[i1], scaler_X.mean_[i2]])
-    scales = np.array([scaler_X.scale_[i1], scaler_X.scale_[i2]])
-    return (arr - means) / scales
-
-X_arr = X_feat_scaled.values
-
 if run_gs10_splits and target_col in y_clean.columns:
     gs10_ret      = y_clean_1m[target_col].values   # Sharpe/P&L always uses 1-month forward return
     gs10_index    = y_clean[target_col].index
     ann_factor    = np.sqrt(12)
+    score_lbl     = _score_label()
     always_ret    = gs10_ret
-    sharpe_always = always_ret.mean() / (always_ret.std() + 1e-12) * ann_factor
+    sharpe_always = always_ret.mean() / (_risk_denom(always_ret) + 1e-12) * ann_factor
     cum_always    = np.cumsum(always_ret)
     percentiles   = [20, 40, 60, 80]
     split_rows    = []
@@ -181,9 +176,9 @@ if run_gs10_splits and target_col in y_clean.columns:
             ls_sign    = 1.0 if ls_raw.sum() >= 0 else -1.0
             ls_ret     = ls_raw * ls_sign
 
-            sh_high    = high_ret.mean() / (high_ret.std() + 1e-12) * ann_factor
-            sh_low     = low_ret.mean()  / (low_ret.std()  + 1e-12) * ann_factor
-            sh_ls      = ls_ret.mean()   / (ls_ret.std()   + 1e-12) * ann_factor
+            sh_high    = high_ret.mean() / (_risk_denom(high_ret) + 1e-12) * ann_factor
+            sh_low     = low_ret.mean()  / (_risk_denom(low_ret)  + 1e-12) * ann_factor
+            sh_ls      = ls_ret.mean()   / (_risk_denom(ls_ret)   + 1e-12) * ann_factor
 
             # Rescale each series' vol to match the always-invested vol, so the
             # cumulative-return plot compares returns at a common risk level
@@ -203,16 +198,16 @@ if run_gs10_splits and target_col in y_clean.columns:
                 ls_lbl = 'L/S (flipped)' if ls_sign < 0 else 'L/S'
                 ax = axes[p_idx // 2][p_idx % 2]
                 ax.plot(gs10_index, cum_always,
-                        label=f'Always  SR={sharpe_always:.2f}',
+                        label=f'Always  {score_lbl}={sharpe_always:.2f}',
                         color='steelblue', linewidth=1.2, alpha=0.7)
                 ax.plot(gs10_index, np.cumsum(high_ret_scaled),
-                        label=f'High >p{pct} ({frac_high:.0%})  SR={sh_high:.2f}',
+                        label=f'High >p{pct} ({frac_high:.0%})  {score_lbl}={sh_high:.2f}',
                         color='darkgreen', linewidth=1.3)
                 ax.plot(gs10_index, np.cumsum(low_ret_scaled),
-                        label=f'Low ≤p{pct} ({frac_low:.0%})  SR={sh_low:.2f}',
+                        label=f'Low ≤p{pct} ({frac_low:.0%})  {score_lbl}={sh_low:.2f}',
                         color='firebrick', linewidth=1.3)
                 ax.plot(gs10_index, np.cumsum(ls_ret_scaled),
-                        label=f'{ls_lbl}  SR={sh_ls:.2f}',
+                        label=f'{ls_lbl}  {score_lbl}={sh_ls:.2f}',
                         color='darkorange', linewidth=1.3, linestyle='--')
                 ax.axhline(0, color='black', linewidth=0.4, linestyle='--')
                 ax.set_title(f'Split at {pct}th pct  (threshold = {threshold:.3f})', fontsize=9)
@@ -227,306 +222,25 @@ if run_gs10_splits and target_col in y_clean.columns:
                   .sort_values('sharpe_long_short', ascending=False)
                   .reset_index(drop=True))
     print(f"\n{target_col} Percentile-Split Backtest Summary  "
-          f"(always-invested Sharpe = {sharpe_always:.2f}):")
+          f"(always-invested {score_lbl} = {sharpe_always:.2f}):")
     print(split_df.to_string(index=False))
-
-if run_gs10_stepwise and target_col in y_clean.columns:
-
-    gs10_ret   = y_clean_1m[target_col].values   # Sharpe/P&L always uses 1-month forward return
-    gs10_index = y_clean[target_col].index
-    ann_factor = np.sqrt(12)
-    pct_grid   = list(range(20, 81, 5))
-    n_obs      = len(gs10_ret)
-
-    def _score(position, ret, af):
-        strat = position * ret
-        sr    = strat.mean() / (strat.std() + 1e-12) * af
-        return sr * np.abs(position).mean() if modified_sharpe else sr
-
-    # Signal types: (on_val, dir_str, off_val).
-    # long/short: one-sided independent rules (off = 0, position is 0 when inactive).
-    # long_short: fully paired two-sided rules (off = ±1, never 0) — each variable
-    #   must go long on one side AND short on the other; no independent half-signals.
-    if direction == 'long':
-        sig_types = [(1.0,  'above', 0.0), (1.0,  'below', 0.0)]
-    elif direction == 'short':
-        sig_types = [(-1.0, 'above', 0.0), (-1.0, 'below', 0.0)]
-    else:   # long_short: long-above/short-below  OR  short-above/long-below
-        sig_types = [(1.0, 'above', -1.0), (-1.0, 'above', 1.0)]
-
-    def _make_sig(x, thr, on_val, dir_str, off_val=0.0):
-        m = x > thr if dir_str == 'above' else x <= thr
-        return np.where(m, on_val, off_val).astype(float)
-
-    # Combinatorial Purged Cross-Validation (CPCV, Lopez de Prado 2018).
-    # Data is split into cpcv_n_groups equal groups; all C(N,k) combinations of
-    # cpcv_k_test groups form the test set.  Training uses the full remaining
-    # groups; instead, each contiguous test block is trimmed by
-    # cpcv_embargo_periods obs on every edge that borders training data, since
-    # those edge observations' features (backward-looking diffs up to
-    # max(lag_periods)) or labels (fwd_periods ahead) reach into training data.
-    # Each observation appears in C(N-1, k-1) test folds; OOS positions are
-    # averaged across those folds to produce one position series.
-    from itertools import combinations as _comb
-
-    _group_size = n_obs // cpcv_n_groups
-    _groups = [
-        np.arange(i * _group_size,
-                  n_obs if i == cpcv_n_groups - 1 else (i + 1) * _group_size)
-        for i in range(cpcv_n_groups)
-    ]
-
-    cpcv_folds = []
-    for _tg in _comb(range(cpcv_n_groups), cpcv_k_test):
-        _tg_set    = set(_tg)
-        _test_full = np.concatenate([_groups[g] for g in sorted(_tg)])
-        _test_idx  = _trim_test_edges(_test_full, n_obs, cpcv_embargo_periods)
-
-        _train_idx = np.concatenate([_groups[g] for g in range(cpcv_n_groups)
-                                     if g not in _tg_set])
-
-        if len(_train_idx) > 0 and len(_test_idx) > 0:
-            cpcv_folds.append((_train_idx, _test_idx))
-
-    n_folds = len(cpcv_folds)
-
-    mode_label = {'long': 'long/flat (0/1)', 'long_short': 'long/short (±1)',
-                  'short': 'short/flat (0/−1)'}[direction]
-    score_lbl  = "MSR" if modified_sharpe else "SR"
-
-    def _is_sig(x_col, on_val, dir_str, off_val, thr):
-        """Full-data IS signal using stored nominal threshold and off value."""
-        return _make_sig(X_feat[x_col].values, thr, on_val, dir_str, off_val)
-
-    def _sig_lbl(on_val, dir_str, off_val):
-        """Human-readable label for a signal type."""
-        if off_val == 0.0:
-            return f"{'long' if on_val > 0 else 'short'},{dir_str}"
-        return f"{'L/S' if on_val > 0 else 'S/L'},above"   # paired long_short
-
-    def _base_var(col):
-        """Each specific x_col is its own bucket (no grouping across lag variants)."""
-        return col
-
-    def _top_n_capped(cands, n=10, cap=capped_10, initial_counts=None):
-        """Return up to n candidates from globally-sorted cands,
-        with at most `cap` entries sharing the same base variable name.
-        initial_counts pre-seeds the per-base counters (for forced first picks)."""
-        from collections import defaultdict
-        base_counts = defaultdict(int)
-        if initial_counts:
-            base_counts.update(initial_counts)
-        selected = []
-        for r in cands:
-            if r[6] <= 0:
-                break
-            base = _base_var(r[0])
-            if base_counts[base] < cap:
-                selected.append(r)
-                base_counts[base] += 1
-            if len(selected) == n:
-                break
-        return selected
-
-    def _stepwise_select(cands, ret, feat_idx, forced_contains, n=10):
-        """Greedy stepwise: add up to n signals that maximally increase cumulative IS Sharpe.
-        Slots listed in forced_contains must pick from variables containing that substring.
-        Unforced slots stop early when no candidate improves IS Sharpe.
-        Returns list of (cand_tuple, signal_array_on_feat_idx)."""
-        active_sigs = []
-        used_idx    = set()
-        xcol_cnt    = {}
-        results     = []
-
-        for slot in range(n):
-            slot_filter = forced_contains[slot] if slot < len(forced_contains) else None
-            best_r = best_sig = None
-            best_sc = -np.inf
-            best_i  = None
-
-            for i, r in enumerate(cands):
-                if i in used_idx or r[6] <= 0:
-                    continue
-                x_col, on_val, dir_str, off_val, pct, thr, _ = r
-                if slot_filter is not None and slot_filter not in x_col:
-                    continue
-                if xcol_cnt.get(_base_var(x_col), 0) >= capped_10:
-                    continue
-                sig = _make_sig(X_feat[x_col].values[feat_idx], thr, on_val, dir_str, off_val)
-                sc  = _score(np.mean(active_sigs + [sig], axis=0), ret, ann_factor)
-                if sc > best_sc:
-                    best_sc, best_r, best_i, best_sig = sc, r, i, sig
-
-            if best_r is None:
-                break
-            cur_sc = (_score(np.mean(active_sigs, axis=0), ret, ann_factor)
-                      if active_sigs else -np.inf)
-            if slot >= len(forced_contains) and best_sc <= cur_sc:
-                break
-
-            active_sigs.append(best_sig)
-            used_idx.add(best_i)
-            xcol_cnt[_base_var(best_r[0])] = xcol_cnt.get(_base_var(best_r[0]), 0) + 1
-            results.append((best_r, best_sig))
-
-        return results
-
-    print(f"\nStepwise {target_col} — CPCV C({cpcv_n_groups},{cpcv_k_test})={n_folds} folds "
-          f"(top-10 by individual IS {score_lbl}, group_size={_group_size}, n_obs={n_obs}) ({mode_label}):")
-
-    oos_pos_sum = np.zeros(n_obs)
-    oos_pos_cnt = np.zeros(n_obs)
-
-    for fold_k, (train_idx, test_idx) in enumerate(cpcv_folds, 1):
-        gs10_tr = gs10_ret[train_idx]
-        gs10_te = gs10_ret[test_idx]
-
-        # Score every (x_col, on_val, dir_str, off_val, pct) individually.
-        # Keep top 3 percentile cutoffs per combination so the same variable/type
-        # can appear up to 3 times in the final top-10.
-        all_cands = []   # (x_col, on_val, dir_str, off_val, pct, thr, sc)
-        for x_col in X_feat_cols:
-            x_tr = X_feat[x_col].values[train_idx]
-            for on_val, dir_str, off_val in sig_types:
-                pct_rows = []
-                for pct in pct_grid:
-                    thr = np.percentile(x_tr, pct)
-                    sc  = _score(_make_sig(x_tr, thr, on_val, dir_str, off_val),
-                                 gs10_tr, ann_factor)
-                    pct_rows.append((pct, thr, sc))
-                # top-3 pct values for this (variable, signal_type) combo
-                pct_rows.sort(key=lambda r: r[2], reverse=True)
-                for pct, thr, sc in pct_rows[:3]:
-                    all_cands.append((x_col, on_val, dir_str, off_val, pct, thr, sc))
-
-        # Stepwise greedy selection: each slot picks the candidate that maximally
-        # increases cumulative IS Sharpe.  Slots 1-2 forced to target_col_diff / DTB3_diff.
-        all_cands.sort(key=lambda r: r[6], reverse=True)
-        sw = _stepwise_select(all_cands, gs10_tr, train_idx,
-                              forced_contains=[f'{target_col}_diff', 'DTB3_diff'])
-
-        active_tr  = [sig for _, sig in sw]
-        active_te  = []
-        selected_f = []
-
-        print(f"  Fold {fold_k}  train[0..{train_idx[-1]}]  test[{test_idx[0]}..{test_idx[-1]}]")
-
-        for rank_i, ((x_col, on_val, dir_str, off_val, pct, thr, indiv_sc), _sig_tr) in enumerate(sw, 1):
-            sig_te = _make_sig(X_feat[x_col].values[test_idx], thr, on_val, dir_str, off_val)
-            active_te.append(sig_te)
-            selected_f.append((x_col, pct, on_val, dir_str, off_val, thr))
-
-            sc_is_now  = _score(np.mean(active_tr[:rank_i], axis=0), gs10_tr, ann_factor)
-            sc_oos_now = _score(np.mean(active_te,           axis=0), gs10_te, ann_factor)
-            print(f"    Rank {rank_i:2d}: {x_col}"
-                  f"({_sig_lbl(on_val, dir_str, off_val)}@p{pct}={thr:.4f})"
-                  f"  indiv IS {score_lbl}={indiv_sc:.4f}"
-                  f"  cumul IS {score_lbl}={sc_is_now:.4f}"
-                  f"  OOS {score_lbl}={sc_oos_now:.4f}")
-
-        pos_te = np.mean(active_te, axis=0) if active_te else np.zeros(len(test_idx))
-        oos_pos_sum[test_idx] += pos_te
-        oos_pos_cnt[test_idx] += 1
-
-        sc_is_f  = _score(np.mean(active_tr, axis=0), gs10_tr, ann_factor) if active_tr else 0.0
-        sc_oos_f = _score(pos_te, gs10_te, ann_factor) if active_te else 0.0
-        print(f"    → {len(selected_f)} rules  IS {score_lbl}={sc_is_f:.4f}"
-              f"  OOS {score_lbl}={sc_oos_f:.4f}")
-
-    # Average predictions across all CPCV folds that covered each observation
-    oos_mask      = oos_pos_cnt > 0
-    oos_positions = np.where(oos_mask, oos_pos_sum / np.maximum(oos_pos_cnt, 1), 0.0)
-
-    sc_oos = _score(oos_positions[oos_mask], gs10_ret[oos_mask], ann_factor)
-    print(f"\n  Combined OOS {score_lbl} (CPCV C({cpcv_n_groups},{cpcv_k_test})={n_folds} folds) = {sc_oos:.4f}")
-
-    # IS reference: stepwise on full data, same sig_types as fold loop
-    full_all_cands = []   # (x_col, on_val, dir_str, off_val, pct, thr, sc)
-    for x_col in X_feat_cols:
-        x_all = X_feat[x_col].values
-        for on_val, dir_str, off_val in sig_types:
-            pct_rows = []
-            for pct in pct_grid:
-                thr = np.percentile(x_all, pct)
-                sc  = _score(_make_sig(x_all, thr, on_val, dir_str, off_val),
-                             gs10_ret, ann_factor)
-                pct_rows.append((pct, thr, sc))
-            pct_rows.sort(key=lambda r: r[2], reverse=True)
-            for pct, thr, sc in pct_rows[:3]:
-                full_all_cands.append((x_col, on_val, dir_str, off_val, pct, thr, sc))
-
-    full_all_cands.sort(key=lambda r: r[6], reverse=True)
-    sw_full = _stepwise_select(full_all_cands, gs10_ret, np.arange(n_obs),
-                               forced_contains=[f'{target_col}_diff', 'DTB3_diff'])
-    active_full_is = [sig for _, sig in sw_full]
-
-    pos_is_full = np.mean(active_full_is, axis=0) if active_full_is else np.zeros(n_obs)
-    sc_is_full  = _score(pos_is_full, gs10_ret, ann_factor)
-
-    if show_plots:
-        oos_dates  = gs10_index[oos_mask]
-        strat_oos  = oos_positions[oos_mask] * gs10_ret[oos_mask]
-        strat_is   = pos_is_full * gs10_ret
-        always_sc  = _score(np.ones(n_obs), gs10_ret, ann_factor)
-
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 7),
-                                        gridspec_kw={'height_ratios': [3, 1]},
-                                        sharex=True)
-
-        ax1.plot(gs10_index, np.cumsum(gs10_ret),
-                 label=f'Always  {score_lbl}={always_sc:.3f}',
-                 color='steelblue', linewidth=1.2, alpha=0.6)
-        ax1.plot(gs10_index, np.cumsum(strat_is),
-                 label=f'In-Sample (full-data stepwise)  {score_lbl}={sc_is_full:.3f}',
-                 color='gray', linewidth=1.2, linestyle='--', alpha=0.8)
-        ax1.plot(oos_dates, np.cumsum(strat_oos),
-                 label=f'OOS (CPCV C({cpcv_n_groups},{cpcv_k_test})={n_folds} folds)  {score_lbl}={sc_oos:.3f}',
-                 color='darkgreen', linewidth=1.5)
-        # shade group boundaries
-        for g in _groups:
-            ax1.axvline(gs10_index[g[0]], color='gray', linewidth=0.4, linestyle=':')
-        ax1.axhline(0, color='black', linewidth=0.4, linestyle='--')
-        ax1.set_title(f'{target_col} Stepwise — CPCV C({cpcv_n_groups},{cpcv_k_test})={n_folds} folds, {mode_label}')
-        ax1.set_ylabel('Cumulative Real Return')
-        ax1.legend()
-
-        if direction in ('long', 'long_short'):
-            ax2.fill_between(gs10_index, pos_is_full, 0,
-                             where=pos_is_full > 0, color='darkgreen', alpha=0.5, label='Long (IS)')
-        if direction in ('short', 'long_short'):
-            ax2.fill_between(gs10_index, pos_is_full, 0,
-                             where=pos_is_full < 0, color='firebrick', alpha=0.5, label='Short (IS)')
-        ax2.step(oos_dates, oos_positions[oos_mask], color='black',
-                 linewidth=0.9, alpha=0.7, label='OOS position', where='post')
-        for g in _groups:
-            ax2.axvline(gs10_index[g[0]], color='gray', linewidth=0.4, linestyle=':')
-        ax2.axhline(0, color='black', linewidth=0.5)
-        ax2.set_ylabel('Position')
-        y_lo = -1.1 if direction in ('short', 'long_short') else -0.05
-        y_hi =  1.1 if direction in ('long',  'long_short') else  0.05
-        ax2.set_ylim(y_lo, y_hi)
-        ax2.legend(fontsize=8, loc='upper left')
-
-        plt.tight_layout()
-        plt.show()
 
 
 # ── PLS regression on target_col with CPCV ───────────────────────────────────
 if run_gs_pls and target_col in y_clean.columns:
 
-    gs10_ret_p   = y_clean[target_col].values        # fwd_periods-ahead target used to fit PLS
+    gs10_ret_p   = y_clean[target_col].values        # 1-period-ahead target used to fit PLS
     gs10_pnl_p   = y_clean_1m[target_col].values     # 1-month forward return used for Sharpe/P&L
     gs10_index_p = y_clean[target_col].index
     ann_factor_p = np.sqrt(12)
     n_obs_p      = len(gs10_ret_p)
-    score_lbl_p  = "MSR" if modified_sharpe else "SR"
+    score_lbl_p  = _score_label()
 
     def _score_p(pos, ret, af):
         s = pos * ret
-        sr = s.mean() / (s.std() + 1e-12) * af
-        return sr * np.abs(pos).mean() if modified_sharpe else sr
+        return s.mean() / (_risk_denom(s) + 1e-12) * af
 
-    # Build CPCV folds (same logic as run_gs10_stepwise)
+    # Build CPCV folds 
     from itertools import combinations as _comb_p
     _gs_p  = n_obs_p // cpcv_n_groups
     _grps_p = [
@@ -581,6 +295,10 @@ if run_gs_pls and target_col in y_clean.columns:
             return pos
         return np.sign(pos) * np.abs(pos) ** pls_pos_power
 
+    def _size_position(pred, var):
+        """Continuous Kelly position size: pred / realized_var."""
+        return pred / var
+
     nc = 1
     best_oos_sc   = -np.inf
     best_nc       = 1
@@ -609,13 +327,13 @@ if run_gs_pls and target_col in y_clean.columns:
 
         pred_tr  = pls.predict(X_tr).ravel()
         pred_te  = pls.predict(X_te).ravel()
-        tr_std   = pred_tr.std() + 1e-12   # scale from training period only
-        pos_te   = _apply_power(_apply_direction(pred_te / tr_std, te_idx))
+        tr_var   = gs10_pnl_p[tr_idx].var() + 1e-12   # realized return variance, training period only
+        pos_te   = _apply_power(_apply_direction(_size_position(pred_te, tr_var), te_idx))
 
         oos_pos_sum[te_idx] += pos_te
         oos_pos_cnt[te_idx] += 1
 
-        pos_tr      = _apply_power(_apply_direction(pred_tr / tr_std, tr_idx))
+        pos_tr      = _apply_power(_apply_direction(_size_position(pred_tr, tr_var), tr_idx))
         is_sc_fold  = _score_p(pos_tr, gs10_pnl_p[tr_idx], ann_factor_p)
         oos_sc_fold = _score_p(pos_te, gs10_pnl_p[te_idx], ann_factor_p)
         is_sc_folds.append(is_sc_fold)
@@ -648,7 +366,8 @@ if run_gs_pls and target_col in y_clean.columns:
     pls_is = PLSRegression(n_components=nc_safe_is, scale=False)
     pls_is.fit(X_pls, gs10_ret_p.reshape(-1, 1))
     pred_is    = pls_is.predict(X_pls).ravel()
-    pos_is     = _apply_power(_apply_direction(pred_is / (pred_is.std() + 1e-12), np.arange(n_obs_p)))
+    full_var   = gs10_pnl_p.var() + 1e-12   # realized return variance, full dataset
+    pos_is     = _apply_power(_apply_direction(_size_position(pred_is, full_var), np.arange(n_obs_p)))
 
     sc_is  = _score_p(pos_is,               gs10_pnl_p,              ann_factor_p)
     sc_oos = _score_p(oos_pos[oos_mask_p],  gs10_pnl_p[oos_mask_p],  ann_factor_p)
@@ -686,13 +405,6 @@ if run_gs_pls and target_col in y_clean.columns:
         strat_lo_is = lo_is_pos * gs10_pnl_p
         sc_lo_is    = _score_p(lo_is_pos, gs10_pnl_p, ann_factor_p)
 
-        # Rescale each series' vol to match the always-long vol, so the
-        # cumulative-return plot compares returns at a common risk level
-        # (Sharpe ratios above are unaffected — they're scale-invariant).
-        std_target_p   = gs10_pnl_p.std() + 1e-12
-        strat_is_p_sc  = strat_is_p  * (std_target_p / (strat_is_p.std()  + 1e-12))
-        strat_lo_is_sc = strat_lo_is * (std_target_p / (strat_lo_is.std() + 1e-12))
-
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 7),
                                         gridspec_kw={'height_ratios': [3, 1]},
                                         sharex=True)
@@ -700,10 +412,10 @@ if run_gs_pls and target_col in y_clean.columns:
         ax1.plot(gs10_index_p, np.cumsum(gs10_pnl_p),
                  label=f'Always long  {score_lbl_p}={always_sc_p:.3f}',
                  color='steelblue', linewidth=1.2, alpha=0.6)
-        ax1.plot(gs10_index_p, np.cumsum(strat_is_p_sc),
+        ax1.plot(gs10_index_p, np.cumsum(strat_is_p),
                  label=f'IS ({best_nc} comps)  {score_lbl_p}={best_sc_is:.3f}',
                  color='gray', linewidth=1.5)
-        ax1.plot(gs10_index_p, np.cumsum(strat_lo_is_sc),
+        ax1.plot(gs10_index_p, np.cumsum(strat_lo_is),
                  label=f'Long-only IS  {score_lbl_p}={sc_lo_is:.3f}',
                  color='orange', linewidth=1.5)
         for g in _grps_p:
@@ -771,19 +483,10 @@ if run_gs_pls and target_col in y_clean.columns:
             is_always_sc  = _score_p(np.ones(len(tr_idx)), gs10_pnl_p[tr_idx], ann_factor_p)
             oos_always_sc = _score_p(np.ones(len(te_idx)), gs10_pnl_p[te_idx], ann_factor_p)
 
-            # Scale LS and LO positions (IS and OOS alike) so that each strategy's
-            # OWN in-sample return vol matches the in-sample always-long vol —
-            # the scale factor is fit on IS only, then applied unchanged to OOS,
-            # so the two curves are shown on the same risk footing without any
-            # look-ahead from the test period.
-            std_is_always = gs10_pnl_p[tr_idx].std() + 1e-12
-            scale_ls = std_is_always / ((pos_tr    * gs10_pnl_p[tr_idx]).std() + 1e-12)
-            scale_lo = std_is_always / ((lo_pos_tr * gs10_pnl_p[tr_idx]).std() + 1e-12)
-
-            curve_is_ls  = _anchored_segment_curve(tr_idx, pos_tr    * scale_ls)
-            curve_oos_ls = _anchored_segment_curve(te_idx, pos_te    * scale_ls)
-            curve_is_lo  = _anchored_segment_curve(tr_idx, lo_pos_tr * scale_lo)
-            curve_oos_lo = _anchored_segment_curve(te_idx, lo_pos_te * scale_lo)
+            curve_is_ls  = _anchored_segment_curve(tr_idx, pos_tr)
+            curve_oos_ls = _anchored_segment_curve(te_idx, pos_te)
+            curve_is_lo  = _anchored_segment_curve(tr_idx, lo_pos_tr)
+            curve_oos_lo = _anchored_segment_curve(te_idx, lo_pos_te)
 
             ax.plot(gs10_index_p, cum_always_p, color='steelblue', linewidth=0.8, alpha=0.4)
             ax.plot(gs10_index_p, curve_is_ls,  color='gray',       linewidth=1.0, linestyle='--')
