@@ -375,6 +375,28 @@ if run_gs_pls and target_col in y_clean.columns:
     print(f"  {nc:>6}  {sc_is:>8.4f}  {sc_oos:>9.4f}"
           f"  {is_sc_std:>8.4f}  {oos_sc_std:>8.4f}")
 
+    # OOS Sharpe & Sortino — long-only vs long/short vs always-long ─────────
+    def _oos_sharpe(x):
+        return x.mean() / (x.std() + 1e-12) * ann_factor_p
+
+    def _oos_sortino(x):
+        downside = np.sqrt(np.mean(np.minimum(x, 0.0) ** 2))
+        return x.mean() / (downside + 1e-12) * ann_factor_p
+
+    oos_ret_p    = gs10_pnl_p[oos_mask_p]
+    oos_pos_ls   = oos_pos[oos_mask_p]
+    oos_pos_lo   = np.maximum(oos_pos_ls, 0.0)
+
+    always_oos_strat = oos_ret_p
+    lo_oos_strat      = oos_pos_lo * oos_ret_p
+    ls_oos_strat      = oos_pos_ls * oos_ret_p
+
+    print(f"\n  OOS performance after {n_pls_folds} folds — long-only vs long/short vs always-long:")
+    print(f"  {'':>12}  {'Sharpe':>8}  {'Sortino':>8}")
+    print(f"  {'Always long':>12}  {_oos_sharpe(always_oos_strat):>8.4f}  {_oos_sortino(always_oos_strat):>8.4f}")
+    print(f"  {'Long only':>12}  {_oos_sharpe(lo_oos_strat):>8.4f}  {_oos_sortino(lo_oos_strat):>8.4f}")
+    print(f"  {'Long/short':>12}  {_oos_sharpe(ls_oos_strat):>8.4f}  {_oos_sortino(ls_oos_strat):>8.4f}")
+
     if sc_oos > best_oos_sc:
         best_oos_sc   = sc_oos
         best_nc       = nc
